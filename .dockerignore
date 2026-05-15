@@ -1,0 +1,37 @@
+# Build context is the whole repo, but the Dockerfile never COPYs run.py
+# or configs/ — they're bind-mounted at runtime. Excluding them here keeps
+# the context tarball small and stops accidental leaks (pcaps, .git, logs)
+# from landing in image layers.
+
+.git
+.gitignore
+.dockerignore
+
+# Runtime artifacts — never belong in the build context.
+captures/
+logs/
+*.pcap
+*.pcapng
+
+# Configs are bind-mounted at runtime, never COPYd — listing here means
+# accidental future COPY-by-name from configs/ won't silently change image
+# contents based on uncommitted local edits.
+#
+# run.py IS COPYd as a fallback (see Dockerfile), so it's deliberately
+# NOT excluded here. The bind mount at /work/run.py wins at runtime.
+configs/
+
+# Python / editor cruft.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.idea/
+.vscode/
+
+# Renovate config is metadata for the host repo, not the image.
+renovate.json
+
+# Docs (none today, but pre-emptive: README, etc. don't belong in the image).
+README*
+docs/
