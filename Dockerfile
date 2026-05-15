@@ -59,21 +59,18 @@ RUN git clone --depth 1 --branch ${SRSRAN_REF} \
 # release_23_11 builds with -Werror, so demote those two to warnings.
 #
 # `make install` puts binaries in /usr/local/bin and the shared libs srsenb
-# links against (libsrsran_rf.so etc.) in /usr/local/lib. We stage the install
-# tree under /out, then strip headers and static archives — the runtime stage
-# only needs binaries and shared libs, so shipping the rest is dead weight in
-# the final image (~tens of MB).
+# dlopens (libsrsran_rf.so etc.) in /usr/local/lib, with the canonical
+# .so → .so.MAJOR → .so.X.Y.Z symlink trio. We stage the install tree under
+# /out so the runtime stage gets one COPY for everything; trusting upstream's
+# install target is the canonical multi-stage idiom (vs. curating the build
+# tree by hand, which couples this Dockerfile to upstream's internal layout).
 WORKDIR /src/srsRAN_4G/build
 RUN cmake -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DCMAKE_CXX_FLAGS="-Wno-error=array-bounds -Wno-error=stringop-overflow -Wno-error=maybe-uninitialized" \
         .. \
     && make -j"$(nproc)" srsenb srsue \
-    && DESTDIR=/out make install \
-    && rm -rf /out/usr/local/include \
-    && find /out/usr/local/lib -name '*.a' -delete \
-    && find /out/usr/local/lib -name 'cmake' -type d -prune -exec rm -rf {} + \
-    && find /out/usr/local/lib -name 'pkgconfig' -type d -prune -exec rm -rf {} +
+    && DESTDIR=/out make install
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
@@ -124,10 +121,13 @@ RUN add-apt-repository -y ppa:open5gs/latest \
         open5gs=${OPEN5GS_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
-# Pull the srsRAN install tree (binaries + libsrsran_*.so) out of builder.
-# This is the only line that "depends on" the builder stage, so the runtime
-# layer cache is preserved across srsRAN rebuilds as long as runtime deps
-# don't move. ldconfig refreshes the linker cache so the libs are findable.
+# Pull the srsRAN install tree (binaries + libsrsran_*.so + symlinks) out of
+# builder. This is the only line that "depends on" the builder stage, so the
+# runtime layer cache is preserved across srsRAN rebuilds as long as runtime
+# deps don't move. ldconfig refreshes the linker cache so the libs are
+# findable. The install tree carries a handful of dev-only files (headers,
+# .a, .cmake, .pc, helper shell scripts) — roughly 10–20 MB in a 1.5 GB
+# image, not worth curating around upstream's contract.
 COPY --from=builder /out/usr/local/ /usr/local/
 RUN ldconfig
 
