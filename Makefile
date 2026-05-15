@@ -19,7 +19,9 @@ NAME        ?= legit_attach
 # --rm: each capture is a fresh run; no state between invocations.
 # -e HOST_UID/HOST_GID: run.py chowns pcap+meta back to the host user on exit
 #   so the bind-mounted captures/ stays user-owned (container itself runs as
-#   root because srsenb/UPF need it).
+#   root because srsenb/UPF need it). When invoked under sudo we prefer
+#   SUDO_UID/SUDO_GID — `id -u` would otherwise report root and the chown
+#   would be a no-op.
 # Only captures/ is bind-mounted: logs stay inside the container (--rm wipes
 #   them). On failure, run.py prints the last lines of the dying daemon's
 #   log to stderr — debugging path matches `docker logs` idiom.
@@ -28,8 +30,8 @@ DOCKER_RUN := docker run --rm \
 	--cap-add=NET_ADMIN \
 	--device /dev/net/tun \
 	--ulimit core=0 \
-	-e HOST_UID=$(shell id -u) \
-	-e HOST_GID=$(shell id -g) \
+	-e HOST_UID=$(if $(SUDO_UID),$(SUDO_UID),$(shell id -u)) \
+	-e HOST_GID=$(if $(SUDO_GID),$(SUDO_GID),$(shell id -g)) \
 	-v $(REPO_DIR)/run.py:/work/run.py:ro \
 	-v $(REPO_DIR)/configs:/work/configs:ro \
 	-v $(REPO_DIR)/configs/open5gs:/etc/open5gs:ro \
