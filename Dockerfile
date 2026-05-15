@@ -150,10 +150,9 @@ WORKDIR /work
 COPY run.py /work/run.py
 
 # OCI image metadata — surfaces in `docker inspect`, registry UIs, etc.
-# `source` is intentionally omitted: this repo has no canonical remote.
-# Add it (and a license) before any registry push.
 LABEL org.opencontainers.image.title="ran-testbed" \
-      org.opencontainers.image.description="LTE testbed: Open5GS 4G core + srsRAN_4G (srsenb+srsue) over ZMQ, with attach capture."
+      org.opencontainers.image.description="LTE testbed: Open5GS 4G core + srsRAN_4G (srsenb+srsue) over ZMQ, with attach capture." \
+      org.opencontainers.image.source="https://github.com/bartalor/ran-testbed"
 
 ENTRYPOINT ["python3", "/work/run.py"]
 CMD ["--help"]
