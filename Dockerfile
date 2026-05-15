@@ -41,11 +41,20 @@ ARG SRSRAN_REF=release_23_11
 RUN git clone --depth 1 --branch ${SRSRAN_REF} \
         https://github.com/srsran/srsRAN_4G.git /src/srsRAN_4G
 
+# gcc 13 + libstdc++ raises false-positive -Warray-bounds / -Wstringop-overflow
+# in srsenb's rrc_mobility.cc (std::copy over small fixed-size buffers).
+# release_23_11 builds with -Werror, so demote those two to warnings.
+#
+# `make install` puts binaries in /usr/local/bin and the shared libs srsenb
+# links against (libsrsran_rf.so etc.) in /usr/local/lib. We stage the whole
+# install tree under /out so the runtime stage gets one COPY for everything.
 WORKDIR /src/srsRAN_4G/build
-RUN cmake -DCMAKE_BUILD_TYPE=Release .. \
+RUN cmake -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_CXX_FLAGS="-Wno-error=array-bounds -Wno-error=stringop-overflow -Wno-error=maybe-uninitialized" \
+        .. \
     && make -j"$(nproc)" srsenb srsue \
-    && install -Dm755 srsenb/src/srsenb /out/srsenb \
-    && install -Dm755 srsue/src/srsue   /out/srsue
+    && DESTDIR=/out make install
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
@@ -66,7 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iputils-ping \
         tcpdump \
         python3 \
-        libfftw3-double3 \
+        libfftw3-single3 \
         libmbedtls14t64 \
         libsctp1 \
         libconfig++9v5 \
@@ -93,11 +102,12 @@ RUN add-apt-repository -y ppa:open5gs/latest \
         open5gs=${OPEN5GS_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
-# Pull srsRAN binaries out of builder. This is the only line that "depends on"
-# the builder stage, so the runtime layer cache is preserved across srsRAN
-# rebuilds as long as runtime deps don't move.
-COPY --from=builder /out/srsenb /usr/local/bin/srsenb
-COPY --from=builder /out/srsue  /usr/local/bin/srsue
+# Pull the srsRAN install tree (binaries + libsrsran_*.so) out of builder.
+# This is the only line that "depends on" the builder stage, so the runtime
+# layer cache is preserved across srsRAN rebuilds as long as runtime deps
+# don't move. ldconfig refreshes the linker cache so the libs are findable.
+COPY --from=builder /out/usr/local/ /usr/local/
+RUN ldconfig
 
 # Stamp pin versions into the image so run.py can record them into meta JSON.
 ENV SRSRAN_REF=${SRSRAN_REF} \
