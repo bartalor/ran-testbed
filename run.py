@@ -140,6 +140,20 @@ class IMSI:
         return self.value[3 : 3 + len(plmn.mnc)]
 
 
+@dataclass(frozen=True)
+class UECreds:
+    """UE identity + LTE root keys as configured in srsue's ue.conf.
+
+    `k` is the 128-bit subscriber key; `opc` is the operator variant of OP
+    (precomputed so the network doesn't need OP). Both are 32-hex-char
+    (16 bytes). HSS stores the same triple — provisioning copies them across
+    so the UE and HSS share a key, which is the whole point of AKA.
+    """
+    imsi: IMSI
+    k: str
+    opc: str
+
+
 # ---------- config parsing ----------
 
 _ENB_MCC_RE = re.compile(r"^\s*mcc\s*=\s*(\S+)\s*(?:#.*)?$")
@@ -231,14 +245,28 @@ def parse_mme_plmn_tac(path: Path) -> tuple[PLMN, int]:
     return plmns[0], tacs[0]
 
 
-def parse_ue_imsi(path: Path) -> IMSI:
+def parse_ue_creds(path: Path) -> UECreds:
+    """Parse imsi/k/opc from srsue's ue.conf. Exactly one active line of each."""
     imsis: list[str] = []
+    ks: list[str] = []
+    opcs: list[str] = []
     for line in _uncommented_lines(path):
         if m := _UE_IMSI_RE.match(line):
             imsis.append(m.group(1))
+        if m := _UE_K_RE.match(line):
+            ks.append(m.group(1))
+        if m := _UE_OPC_RE.match(line):
+            opcs.append(m.group(1))
     if len(imsis) != 1:
         die(f"{path}: expected exactly one active imsi=, got {imsis}")
-    return IMSI(imsis[0])
+    if len(ks) != 1:
+        die(f"{path}: expected exactly one active k=, got {ks}")
+    if len(opcs) != 1:
+        die(f"{path}: expected exactly one active opc=, got {opcs}")
+    k, opc = ks[0].lower(), opcs[0].lower()
+    if len(k) != 32 or len(opc) != 32:
+        die(f"{path}: k and opc must be 32 hex chars (128 bits); got k={len(k)}, opc={len(opc)}")
+    return UECreds(imsi=IMSI(imsis[0]), k=k, opc=opc)
 
 
 # ---------- process supervision ----------
@@ -434,6 +462,76 @@ def mongosh_ping() -> bool:
     return r.returncode == 0 and r.stdout.strip().endswith("1")
 
 
+def provision_subscriber(creds: UECreds, apn: str = "internet") -> None:
+    """Upsert one subscriber doc into open5gs.subscribers via mongosh.
+
+    Matches the schema written by open5gs-dbctl / the Open5GS WebUI: HSS
+    reads `imsi` + `security.{k,opc,amf}` for AKA, and the `slice[0].session`
+    list for APN→PGW resolution. Upsert (not insert) so re-running the
+    runner against a persisted Mongo volume is idempotent — the same UE
+    creds overwrite cleanly.
+
+    `amf` is the Authentication Management Field, fixed at 0x8000 for LTE
+    (per 3GPP TS 33.401, the high bit indicates "separation bit set").
+    """
+    doc = {
+        "imsi": creds.imsi.value,
+        "subscribed_rau_tau_timer": 12,
+        "network_access_mode": 0,
+        "subscriber_status": 0,
+        "access_restriction_data": 32,
+        "security": {
+            "k": creds.k,
+            "opc": creds.opc,
+            "op": None,
+            "amf": "8000",
+        },
+        "ambr": {
+            "downlink": {"value": 1, "unit": 3},
+            "uplink": {"value": 1, "unit": 3},
+        },
+        "slice": [{
+            "sst": 1,
+            "default_indicator": True,
+            "session": [{
+                "name": apn,
+                "type": 3,
+                "pcc_rule": [],
+                "ambr": {
+                    "downlink": {"value": 1, "unit": 3},
+                    "uplink": {"value": 1, "unit": 3},
+                },
+                "qos": {
+                    "index": 9,
+                    "arp": {
+                        "priority_level": 8,
+                        "pre_emption_capability": 1,
+                        "pre_emption_vulnerability": 1,
+                    },
+                },
+            }],
+        }],
+    }
+    script = (
+        f"db.subscribers.updateOne("
+        f"  {{imsi: {json.dumps(creds.imsi.value)}}},"
+        f"  {{$set: {json.dumps(doc)}}},"
+        f"  {{upsert: true}}"
+        f")"
+    )
+    r = subprocess.run(
+        [
+            "mongosh", "--quiet",
+            "--host", MONGO_HOST, "--port", str(MONGO_PORT),
+            "open5gs", "--eval", script,
+        ],
+        capture_output=True, text=True, check=False, timeout=10.0,
+    )
+    if r.returncode != 0:
+        die(f"subscriber provisioning failed: {r.stderr.strip() or r.stdout.strip()}")
+    log(f"subscriber provisioned: imsi={creds.imsi.value} apn={apn}", "ok")
+
+
 def preflight() -> None:
     """Validate config consistency before bringing anything up.
 
@@ -452,7 +550,7 @@ def preflight() -> None:
     enb_plmn = parse_enb_plmn(enb_conf)
     enb_tac = parse_rr_tac(rr_conf)
     mme_plmn, mme_tac = parse_mme_plmn_tac(mme_conf)
-    imsi = parse_ue_imsi(ue_conf)
+    imsi = parse_ue_creds(ue_conf).imsi
 
     if enb_plmn != mme_plmn:
         die(f"PLMN mismatch: enb={enb_plmn}, mme={mme_plmn}")
@@ -506,8 +604,13 @@ def _open5gs_spec(daemon: str) -> ComponentSpec:
     )
 
 
-def _bring_up_core(stack: contextlib.ExitStack) -> None:
+def _bring_up_core(stack: contextlib.ExitStack, ue_creds: UECreds) -> None:
     """Enter Mongo + 8 Open5GS daemons into the given ExitStack.
+
+    Sequence: mongo → provision subscriber → 8 Open5GS daemons → wait for
+    MME SCTP listener. Subscriber must exist before HSS first reads it
+    (HSS only queries Mongo on demand, so timing is generous, but doing it
+    pre-launch keeps the failure mode obvious).
 
     Bails out (via die) if any daemon doesn't reach ready within timeout —
     the ExitStack ensures already-started daemons are torn down on the way
@@ -518,6 +621,8 @@ def _bring_up_core(stack: contextlib.ExitStack) -> None:
         _dump_log_tail(mongo.log_path)
         die("mongod did not become ready")
     log("mongod ready", "ok")
+
+    provision_subscriber(ue_creds)
 
     # Launch all 8 daemons; no per-daemon readiness (they'd need YAML-derived
     # port probes — overkill). The MME SCTP gate below is the real signal.
@@ -577,6 +682,8 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
     require_root()
     preflight()
 
+    ue_creds = parse_ue_creds(CONFIG_DIR / "ue.conf")
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -589,7 +696,7 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
     # Order: mongo → 8 open5gs daemons → tcpdump → srsenb → srsue.
     # Teardown unwinds the opposite way.
     with contextlib.ExitStack() as stack:
-        _bring_up_core(stack)
+        _bring_up_core(stack, ue_creds)
 
         tcpdump = stack.enter_context(running(_tcpdump_spec(pcap_path)))
         if not tcpdump.wait_ready(timeout=5.0):
@@ -615,13 +722,12 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
         # ExitStack stops UE → eNB → tcpdump → open5gs → mongo here.
 
     enb_plmn = parse_enb_plmn(CONFIG_DIR / "enb.conf")
-    ue_imsi = parse_ue_imsi(CONFIG_DIR / "ue.conf")
     meta = {
         "name": name,
         "timestamp": ts,
         "attached": attached,
         "plmn": {"mcc": enb_plmn.mcc, "mnc": enb_plmn.mnc},
-        "imsi": ue_imsi.value,
+        "imsi": ue_creds.imsi.value,
         "srsran_ref": os.environ.get("SRSRAN_REF"),
         "open5gs_version": os.environ.get("OPEN5GS_VERSION"),
         "mongo_version": os.environ.get("MONGO_VERSION"),
