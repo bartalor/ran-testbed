@@ -13,7 +13,7 @@ Run as root (it needs to start systemd units, launch srsenb/srsue/tcpdump):
 from __future__ import annotations
 
 import argparse
-import atexit
+import contextlib
 import datetime as dt
 import json
 import os
@@ -182,23 +182,9 @@ class ComponentProc:
     spec: ComponentSpec
     proc: subprocess.Popen
     log_path: Path
+    reader: threading.Thread
     ready_event: threading.Event = field(default_factory=threading.Event)
     fail_event: threading.Event = field(default_factory=threading.Event)
-    _reader: threading.Thread | None = None
-
-    def _pump(self, fh) -> None:
-        assert self.proc.stdout is not None
-        for raw in self.proc.stdout:
-            fh.write(raw)
-            fh.flush()
-            line = raw.decode("utf-8", errors="replace")
-            rx_ready = self.spec.ready_regex
-            rx_fail = self.spec.fail_regex
-            if rx_ready and not self.ready_event.is_set() and rx_ready.search(line):
-                self.ready_event.set()
-            if rx_fail and rx_fail.search(line):
-                self.fail_event.set()
-        fh.close()
 
     def wait_ready(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -212,72 +198,106 @@ class ComponentProc:
             time.sleep(0.1)
         return False
 
-    def stop(self, sig: int = signal.SIGTERM, timeout: float = 5.0) -> None:
-        if self.proc.poll() is not None:
-            return
-        log(f"stop {self.spec.name} (pid={self.proc.pid}, sig={sig})")
-        try:
-            os.killpg(os.getpgid(self.proc.pid), sig)
-        except ProcessLookupError:
-            return
-        try:
-            self.proc.wait(timeout=timeout)
-            return
-        except subprocess.TimeoutExpired:
-            log(f"{self.spec.name} did not exit on SIGTERM, sending SIGKILL", "warn")
-        try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        try:
-            self.proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            log(f"{self.spec.name} ignored SIGKILL", "err")
+    def stop(self, term_timeout: float = 5.0) -> None:
+        """SIGTERM the process group, escalate to SIGKILL, then join the reader.
+
+        Idempotent: safe to call after the process has already exited.
+        Always joins the reader thread (with bounded timeout) so the log file
+        is fully flushed and closed before this returns.
+        """
+        if self.proc.poll() is None:
+            log(f"stop {self.spec.name} (pid={self.proc.pid}, sig=SIGTERM)")
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                try:
+                    self.proc.wait(timeout=term_timeout)
+                except subprocess.TimeoutExpired:
+                    log(f"{self.spec.name} did not exit on SIGTERM, sending SIGKILL", "warn")
+                    try:
+                        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        self.proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        log(f"{self.spec.name} ignored SIGKILL", "err")
+            except ProcessLookupError:
+                pass
+        # Reader exits on stdout EOF; bounded join so the interpreter can't yank
+        # a daemon thread mid-write and truncate the log.
+        self.reader.join(timeout=2.0)
+        if self.reader.is_alive():
+            log(f"{self.spec.name} reader thread did not exit within 2s", "warn")
 
 
-PROCS: list[ComponentProc] = []
+def _pump(cp_box: list[ComponentProc], fh) -> None:
+    """Reader thread body. cp_box is a one-element list so we can pass the
+    ComponentProc reference before it's constructed (chicken-and-egg with
+    the Thread()). Closes fh on exit, guaranteed."""
+    try:
+        cp = cp_box[0]
+        assert cp.proc.stdout is not None
+        rx_ready = cp.spec.ready_regex
+        rx_fail = cp.spec.fail_regex
+        for raw in cp.proc.stdout:
+            fh.write(raw)
+            fh.flush()
+            line = raw.decode("utf-8", errors="replace")
+            if rx_ready and not cp.ready_event.is_set() and rx_ready.search(line):
+                cp.ready_event.set()
+            if rx_fail and rx_fail.search(line):
+                cp.fail_event.set()
+    finally:
+        fh.close()
 
 
-def start(spec: ComponentSpec) -> ComponentProc:
+@contextlib.contextmanager
+def running(spec: ComponentSpec):
+    """Start spec, yield ComponentProc, guarantee stop() on exit (any path)."""
     log(f"start {spec.name}: {' '.join(spec.argv)}")
     log_path = LOG_DIR / f"{spec.name}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(log_path, "wb")
-    proc = subprocess.Popen(
-        spec.argv,
-        cwd=str(spec.cwd) if spec.cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        preexec_fn=os.setsid,
+    try:
+        proc = subprocess.Popen(
+            spec.argv,
+            cwd=str(spec.cwd) if spec.cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+    except BaseException:
+        fh.close()
+        raise
+
+    cp_box: list[ComponentProc] = []
+    reader = threading.Thread(
+        target=_pump, args=(cp_box, fh), daemon=True, name=f"reader-{spec.name}"
     )
-    cp = ComponentProc(spec=spec, proc=proc, log_path=log_path)
-    cp._reader = threading.Thread(
-        target=cp._pump, args=(fh,), daemon=True, name=f"reader-{spec.name}"
-    )
-    cp._reader.start()
-    PROCS.append(cp)
-    return cp
+    cp = ComponentProc(spec=spec, proc=proc, log_path=log_path, reader=reader)
+    cp_box.append(cp)
+    reader.start()
+
+    try:
+        yield cp
+    finally:
+        cp.stop()
 
 
-# ---------- teardown ----------
+# ---------- signal handling ----------
 
-def teardown_all() -> None:
-    if not PROCS:
-        return
-    log("teardown: stopping launched components")
-    for c in reversed(PROCS):
-        c.stop()
-    PROCS.clear()
+class _Interrupted(SystemExit):
+    """Raised from a signal handler so context-manager `finally` blocks run."""
 
 
 def _signal_handler(signum, _frame):
-    log(f"caught signal {signum}, tearing down", "warn")
-    teardown_all()
-    sys.exit(128 + signum)
+    # Just raise — every component is held inside a `with running(...)` block
+    # whose __exit__ will run cleanup. No global state, no double-teardown,
+    # no reentrancy concerns.
+    raise _Interrupted(128 + signum)
 
 
-atexit.register(teardown_all)
 for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(_sig, _signal_handler)
 
@@ -415,26 +435,29 @@ def run_capture(name: str, attach_timeout: float = 30.0) -> Path:
     pcap_path = PCAP_DIR / f"{name}_{ts}.pcap"
     meta_path = pcap_path.with_suffix(".json")
 
-    tcpdump = start(_tcpdump_spec(pcap_path))
-    if not tcpdump.wait_ready(timeout=5.0):
-        die("tcpdump did not start listening; see logs/tcpdump.log")
+    attached = False
+    # ExitStack guarantees reverse-order teardown for every entered context,
+    # whether we leave normally, by exception, or via a signal-raised _Interrupted.
+    with contextlib.ExitStack() as stack:
+        tcpdump = stack.enter_context(running(_tcpdump_spec(pcap_path)))
+        if not tcpdump.wait_ready(timeout=5.0):
+            die("tcpdump did not start listening; see logs/tcpdump.log")
 
-    enb = start(_srsenb_spec())
-    if not enb.wait_ready(timeout=15.0):
-        if enb.fail_event.is_set():
-            die("srsenb hit S1 Setup Failure; see logs/srsenb.log")
-        die("srsenb failed to reach ready state; see logs/srsenb.log")
-    log("srsenb ready, S1 established", "ok")
+        enb = stack.enter_context(running(_srsenb_spec()))
+        if not enb.wait_ready(timeout=15.0):
+            if enb.fail_event.is_set():
+                die("srsenb hit S1 Setup Failure; see logs/srsenb.log")
+            die("srsenb failed to reach ready state; see logs/srsenb.log")
+        log("srsenb ready, S1 established", "ok")
 
-    ue = start(_srsue_spec())
-    attached = ue.wait_ready(timeout=attach_timeout)
-    if not attached:
-        log("attach did not complete in time", "err")
-    else:
-        log("attach successful", "ok")
-        time.sleep(2.0)
-
-    teardown_all()
+        ue = stack.enter_context(running(_srsue_spec()))
+        attached = ue.wait_ready(timeout=attach_timeout)
+        if not attached:
+            log("attach did not complete in time", "err")
+        else:
+            log("attach successful", "ok")
+            time.sleep(2.0)
+        # ExitStack stops UE → eNB → tcpdump here, in that order.
 
     enb_plmn = parse_enb_plmn(CONFIG_DIR / "enb.conf")
     ue_imsi = parse_ue_imsi(CONFIG_DIR / "ue.conf")
