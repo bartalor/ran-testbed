@@ -33,11 +33,14 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 LIVE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = LIVE_DIR / "configs"
 OPEN5GS_CONFIG_DIR = CONFIG_DIR / "open5gs"
-LOG_DIR = LIVE_DIR / "logs"
+# Logs go to an in-container path so --rm cleans them up. On failure we dump
+# the dying daemon's log tail to stderr (matches the `docker logs` idiom).
+LOG_DIR = Path("/var/log/ran-testbed")
 DEFAULT_OUT_DIR = LIVE_DIR / "captures"
 
 SRSENB_BIN = Path("/usr/local/bin/srsenb")
@@ -69,10 +72,6 @@ ENB_READY_REGEX = re.compile(r"eNodeB started", re.IGNORECASE)
 S1_SETUP_FAIL_REGEX = re.compile(r"S1 Setup Failure", re.IGNORECASE)
 UE_ATTACH_REGEX = re.compile(r"Network attach successful", re.IGNORECASE)
 TCPDUMP_READY_REGEX = re.compile(r"listening on ", re.IGNORECASE)
-MONGO_READY_REGEX = re.compile(r"Waiting for connections", re.IGNORECASE)
-# Open5GS daemons all print a line like "MME initialize...done" once their
-# SCTP/GTPC/Diameter listeners are bound.
-OPEN5GS_READY_REGEX = re.compile(r"initialize\.\.\.done", re.IGNORECASE)
 
 
 # ---------- logging ----------
@@ -86,6 +85,26 @@ def log(msg: str, level: str = "info") -> None:
 def die(msg: str, code: int = 1):
     log(msg, "err")
     sys.exit(code)
+
+
+def _dump_log_tail(log_path: Path, lines: int = 30) -> None:
+    """Print the last N lines of a daemon log to stderr.
+
+    Used when a daemon dies during bring-up: logs are inside the container
+    and will vanish with --rm, so we have to surface the failure now.
+    """
+    if not log_path.exists():
+        return
+    try:
+        content = log_path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as e:
+        log(f"could not read {log_path}: {e}", "warn")
+        return
+    tail = content.splitlines()[-lines:]
+    sys.stderr.write(f"\n--- last {len(tail)} lines of {log_path} ---\n")
+    sys.stderr.write("\n".join(tail) + "\n")
+    sys.stderr.write("--- end ---\n\n")
+    sys.stderr.flush()
 
 
 # ---------- domain value objects ----------
@@ -127,6 +146,8 @@ _ENB_MCC_RE = re.compile(r"^\s*mcc\s*=\s*(\S+)\s*(?:#.*)?$")
 _ENB_MNC_RE = re.compile(r"^\s*mnc\s*=\s*(\S+)\s*(?:#.*)?$")
 _RR_TAC_RE = re.compile(r"^\s*tac\s*=\s*(\S+?);")
 _UE_IMSI_RE = re.compile(r"^\s*imsi\s*=\s*(\d+)\s*(?:#.*)?$")
+_UE_K_RE = re.compile(r"^\s*k\s*=\s*([0-9A-Fa-f]+)\s*(?:#.*)?$")
+_UE_OPC_RE = re.compile(r"^\s*opc\s*=\s*([0-9A-Fa-f]+)\s*(?:#.*)?$")
 _YAML_MCC_RE = re.compile(r"^\s*mcc:\s*(\S+)\s*$")
 _YAML_MNC_RE = re.compile(r"^\s*mnc:\s*(\S+)\s*$")
 _YAML_TAC_RE = re.compile(r"^\s*tac:\s*(\S+)\s*$")
@@ -224,10 +245,21 @@ def parse_ue_imsi(path: Path) -> IMSI:
 
 @dataclass(frozen=True)
 class ComponentSpec:
+    """Recipe for one supervised child process.
+
+    Readiness has two complementary signals (both optional, at least one
+    required if you call wait_ready):
+      - ready_regex: matched against stderr/stdout. Cheap; works for chatty
+        daemons that print a clear "I'm up" line (srsenb, srsue, tcpdump).
+      - ready_check: callable polled ~10×/s. Use for daemons whose log format
+        is unstable or silent on stderr — e.g. mongod (poll `mongosh ping`).
+    Whichever fires first wins.
+    """
     name: str
     argv: tuple[str, ...]
     cwd: Path | None = None
     ready_regex: re.Pattern[str] | None = None
+    ready_check: Callable[[], bool] | None = None
     fail_regex: re.Pattern[str] | None = None
 
 
@@ -242,6 +274,7 @@ class ComponentProc:
 
     def wait_ready(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
+        check = self.spec.ready_check
         while time.monotonic() < deadline:
             if self.ready_event.is_set():
                 return True
@@ -249,6 +282,9 @@ class ComponentProc:
                 return False
             if self.proc.poll() is not None:
                 return False
+            if check is not None and check():
+                self.ready_event.set()
+                return True
             time.sleep(0.1)
         return False
 
@@ -379,6 +415,25 @@ def sctp_listening(host: str, port: int) -> bool:
     return f"{host}:{port}" in out
 
 
+def mongosh_ping() -> bool:
+    """True iff mongosh can complete `db.adminCommand('ping')`.
+
+    Matches the readiness probe used by the official MongoDB Docker image's
+    entrypoint. Robust across mongod versions (log format changed to JSON
+    in 4.4+); a TCP connect is not sufficient (port opens before the server
+    accepts queries).
+    """
+    r = subprocess.run(
+        [
+            "mongosh", "--quiet",
+            "--host", MONGO_HOST, "--port", str(MONGO_PORT),
+            "--eval", "db.adminCommand('ping').ok",
+        ],
+        capture_output=True, text=True, check=False, timeout=2.0,
+    )
+    return r.returncode == 0 and r.stdout.strip().endswith("1")
+
+
 def preflight() -> None:
     """Validate config consistency before bringing anything up.
 
@@ -416,9 +471,8 @@ def preflight() -> None:
 # ---------- stack lifecycle (mongo + open5gs) ----------
 
 def _mongo_spec() -> ComponentSpec:
-    # In-container layout: /var/lib/mongodb for data, log to stderr (merged
-    # into the per-component log file by _pump). --bind_ip 127.0.0.1 keeps it
-    # off any external interface even if --net=host is used.
+    # No --logpath so mongod's log still reaches _pump (and logs/mongod.log).
+    # Readiness is mongosh ping, not stderr grep — matches the official image.
     return ComponentSpec(
         name="mongod",
         argv=(
@@ -426,15 +480,18 @@ def _mongo_spec() -> ComponentSpec:
             "--dbpath", "/var/lib/mongodb",
             "--bind_ip", MONGO_HOST,
             "--port", str(MONGO_PORT),
-            "--logpath", "/var/log/mongodb/mongod.log",
-            "--logappend",
         ),
-        ready_regex=MONGO_READY_REGEX,
+        ready_check=mongosh_ping,
     )
 
 
 def _open5gs_spec(daemon: str) -> ComponentSpec:
     """Build a ComponentSpec for one Open5GS daemon.
+
+    No per-daemon readiness probe: the daemons start near-instantly and the
+    only readiness that matters to the next stage (srsenb) is the MME's S1AP
+    SCTP listener, gated explicitly at the end of _bring_up_core. Per-daemon
+    health is just "process didn't immediately die" (caught by wait_ready).
 
     `daemon` is the short name ('mme', 'hss', ...). Binary lives at
     /usr/bin/open5gs-<daemon>d, YAML at /etc/open5gs/<daemon>.yaml (which is
@@ -446,7 +503,6 @@ def _open5gs_spec(daemon: str) -> ComponentSpec:
             str(OPEN5GS_BIN_DIR / f"open5gs-{daemon}d"),
             "-c", f"/etc/open5gs/{daemon}.yaml",
         ),
-        ready_regex=OPEN5GS_READY_REGEX,
     )
 
 
@@ -458,22 +514,28 @@ def _bring_up_core(stack: contextlib.ExitStack) -> None:
     out of the caller's `with` block.
     """
     mongo = stack.enter_context(running(_mongo_spec()))
-    if not mongo.wait_ready(timeout=10.0):
-        die("mongod did not become ready; see logs/mongod.log")
+    if not mongo.wait_ready(timeout=20.0):
+        _dump_log_tail(mongo.log_path)
+        die("mongod did not become ready")
     log("mongod ready", "ok")
 
-    for daemon in OPEN5GS_DAEMONS:
-        cp = stack.enter_context(running(_open5gs_spec(daemon)))
-        if not cp.wait_ready(timeout=10.0):
-            die(f"open5gs-{daemon}d did not become ready; see logs/open5gs-{daemon}.log")
+    # Launch all 8 daemons; no per-daemon readiness (they'd need YAML-derived
+    # port probes — overkill). The MME SCTP gate below is the real signal.
+    daemons = [stack.enter_context(running(_open5gs_spec(d))) for d in OPEN5GS_DAEMONS]
 
-    # MME SCTP listener is the real readiness signal for the eNB to attach.
-    deadline = time.monotonic() + 5.0
+    # MME SCTP listener — the only readiness signal the next stage actually
+    # depends on. Generous timeout because HSS Diameter peering with MME can
+    # take a few seconds on cold start.
+    deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
+        for cp in daemons:
+            if cp.proc.poll() is not None:
+                _dump_log_tail(cp.log_path)
+                die(f"{cp.spec.name} died during core bring-up")
         if sctp_listening(MME_SCTP_HOST, MME_SCTP_PORT):
             log("open5gs core up; MME SCTP listening", "ok")
             return
-        time.sleep(0.1)
+        time.sleep(0.2)
     die(f"MME not listening on {MME_SCTP_HOST}:{MME_SCTP_PORT} after core start")
 
 
@@ -531,18 +593,21 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
 
         tcpdump = stack.enter_context(running(_tcpdump_spec(pcap_path)))
         if not tcpdump.wait_ready(timeout=5.0):
-            die("tcpdump did not start listening; see logs/tcpdump.log")
+            _dump_log_tail(tcpdump.log_path)
+            die("tcpdump did not start listening")
 
         enb = stack.enter_context(running(_srsenb_spec()))
         if not enb.wait_ready(timeout=15.0):
+            _dump_log_tail(enb.log_path)
             if enb.fail_event.is_set():
-                die("srsenb hit S1 Setup Failure; see logs/srsenb.log")
-            die("srsenb failed to reach ready state; see logs/srsenb.log")
+                die("srsenb hit S1 Setup Failure")
+            die("srsenb failed to reach ready state")
         log("srsenb ready, S1 established", "ok")
 
         ue = stack.enter_context(running(_srsue_spec()))
         attached = ue.wait_ready(timeout=attach_timeout)
         if not attached:
+            _dump_log_tail(ue.log_path)
             log("attach did not complete in time", "err")
         else:
             log("attach successful", "ok")
@@ -564,9 +629,27 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
         "pcap_size_bytes": pcap_path.stat().st_size if pcap_path.exists() else 0,
     }
     meta_path.write_text(json.dumps(meta, indent=2))
+    _chown_to_host(pcap_path, meta_path)
     log(f"pcap: {pcap_path}", "ok")
     log(f"meta: {meta_path}", "ok")
     return pcap_path
+
+
+def _chown_to_host(*paths: Path) -> None:
+    """Chown artifacts to $HOST_UID:$HOST_GID if those env vars are set.
+
+    Container runs as root (srsenb/UPF/tcpdump need it). Without this, the
+    bind-mounted captures/ ends up root-owned on the host, which is hostile
+    to interactive use. HOST_UID/HOST_GID are injected by the Makefile.
+    """
+    uid_s = os.environ.get("HOST_UID")
+    gid_s = os.environ.get("HOST_GID")
+    if not (uid_s and gid_s):
+        return
+    uid, gid = int(uid_s), int(gid_s)
+    for p in paths:
+        if p.exists():
+            os.chown(p, uid, gid)
 
 
 # ---------- CLI ----------

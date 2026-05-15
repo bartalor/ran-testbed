@@ -13,14 +13,25 @@ NAME        ?= legit_attach
 
 # --net=host: srsenb/srsue/Open5GS all bind 127.0.0.x on loopback; sharing the
 #   host's loopback keeps the SCTP/GTP/ZMQ ports reachable without bridge NAT.
-# --cap-add=NET_ADMIN: tcpdump on lo needs CAP_NET_ADMIN (or running as root
-#   with the inherited cap, which we get inside the container).
-# --rm: each capture is a fresh run; no state to keep between invocations
-#   (configs and outputs are bind-mounted from the repo).
+# --cap-add=NET_ADMIN: tcpdump on lo needs CAP_NET_ADMIN; Open5GS UPF needs it
+#   too to create the ogstun TUN interface.
+# --device /dev/net/tun: UPF opens /dev/net/tun for the ogstun interface.
+# --rm: each capture is a fresh run; no state between invocations.
+# -e HOST_UID/HOST_GID: run.py chowns pcap+meta back to the host user on exit
+#   so the bind-mounted captures/ stays user-owned (container itself runs as
+#   root because srsenb/UPF need it).
+# Only captures/ is bind-mounted: logs stay inside the container (--rm wipes
+#   them). On failure, run.py prints the last lines of the dying daemon's
+#   log to stderr — debugging path matches `docker logs` idiom.
 DOCKER_RUN := docker run --rm \
 	--net=host \
 	--cap-add=NET_ADMIN \
-	-v $(REPO_DIR):/work \
+	--device /dev/net/tun \
+	--ulimit core=0 \
+	-e HOST_UID=$(shell id -u) \
+	-e HOST_GID=$(shell id -g) \
+	-v $(REPO_DIR)/run.py:/work/run.py:ro \
+	-v $(REPO_DIR)/configs:/work/configs:ro \
 	-v $(REPO_DIR)/configs/open5gs:/etc/open5gs:ro \
 	-v $(CAPTURES):/captures \
 	$(IMAGE)
@@ -37,7 +48,10 @@ shell:
 	docker run --rm -it \
 		--net=host \
 		--cap-add=NET_ADMIN \
-		-v $(REPO_DIR):/work \
+		--device /dev/net/tun \
+		--ulimit core=0 \
+		-v $(REPO_DIR)/run.py:/work/run.py:ro \
+		-v $(REPO_DIR)/configs:/work/configs:ro \
 		-v $(REPO_DIR)/configs/open5gs:/etc/open5gs:ro \
 		-v $(CAPTURES):/captures \
 		--entrypoint /bin/bash \
@@ -47,4 +61,4 @@ $(CAPTURES):
 	mkdir -p $@
 
 clean:
-	rm -rf $(REPO_DIR)/logs $(CAPTURES)
+	rm -rf $(CAPTURES)
