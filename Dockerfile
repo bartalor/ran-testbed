@@ -110,6 +110,10 @@ COPY --from=builder /out/usr/local/ /usr/local/
 RUN ldconfig
 
 # Stamp pin versions into the image so run.py can record them into meta JSON.
+# SRSRAN_REF is redeclared here because ARGs don't cross stages — without
+# this redeclaration the ENV would expand to empty in the runtime image.
+# Must match the builder-stage default; --build-arg overrides both at once.
+ARG SRSRAN_REF=release_23_11
 ENV SRSRAN_REF=${SRSRAN_REF} \
     OPEN5GS_VERSION=${OPEN5GS_VERSION} \
     MONGO_VERSION=${MONGO_VERSION}
