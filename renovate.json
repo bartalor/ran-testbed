@@ -1,0 +1,48 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "schedule": ["before 6am on monday"],
+  "packageRules": [
+    {
+      "description": "Group all pin bumps into one PR per week so we don't get flooded.",
+      "matchUpdateTypes": ["major", "minor", "patch", "digest", "pin"],
+      "groupName": "all dependencies",
+      "groupSlug": "all"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Track srsRAN_4G release tag via the SRSRAN_REF Dockerfile ARG.",
+      "customType": "regex",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": [
+        "ARG SRSRAN_REF=(?<currentValue>[^\\s]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "srsran/srsRAN_4G"
+    },
+    {
+      "description": "Track Open5GS apt version (format: X.Y.Z~noble).",
+      "customType": "regex",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": [
+        "ARG OPEN5GS_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)~noble"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "open5gs/open5gs",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "Track MongoDB major.minor channel (matches upstream repo path).",
+      "customType": "regex",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": [
+        "ARG MONGO_VERSION=(?<currentValue>\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "mongodb/mongo",
+      "extractVersionTemplate": "^r(?<version>\\d+\\.\\d+).*$"
+    }
+  ]
+}
