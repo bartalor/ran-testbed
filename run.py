@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Live testbed runner for the LTE rogue-detector project.
+"""Live LTE testbed runner.
 
 Brings up Open5GS 4G core + srsenb + srsue over ZMQ, runs an attach, captures
-S1AP traffic on loopback, tears the stack down.
+S1AP traffic on loopback, tears the stack down. Produces a pcap + meta JSON
+sidecar that downstream tools (detectors, fuzzers, conformance suites) consume
+by path.
 
 Run as root (it needs to start systemd units, launch srsenb/srsue/tcpdump):
     sudo python3 run.py capture legit_attach
+    sudo python3 run.py capture legit_attach --out-dir /path/to/captures
     sudo python3 run.py status
     sudo python3 run.py down
 """
@@ -27,11 +30,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LIVE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = LIVE_DIR / "configs"
 LOG_DIR = LIVE_DIR / "logs"
-PCAP_DIR = PROJECT_ROOT / "sample_pcaps"
+DEFAULT_OUT_DIR = LIVE_DIR / "captures"
 
 SRSENB_BIN = Path("/home/bar/my_dev/srsRAN_4G/build/srsenb/src/srsenb")
 SRSUE_BIN = Path("/home/bar/my_dev/srsRAN_4G/build/srsue/src/srsue")
@@ -425,14 +427,14 @@ def _srsue_spec() -> ComponentSpec:
     )
 
 
-def run_capture(name: str, attach_timeout: float = 30.0) -> Path:
+def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
     require_root()
     preflight()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    PCAP_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    pcap_path = PCAP_DIR / f"{name}_{ts}.pcap"
+    pcap_path = out_dir / f"{name}_{ts}.pcap"
     meta_path = pcap_path.with_suffix(".json")
 
     attached = False
@@ -513,6 +515,12 @@ def main() -> int:
     c = sub.add_parser("capture", help="run attach scenario and save pcap")
     c.add_argument("name", help="scenario name, used in pcap filename")
     c.add_argument("--attach-timeout", type=float, default=30.0)
+    c.add_argument(
+        "--out-dir",
+        type=Path,
+        default=DEFAULT_OUT_DIR,
+        help=f"directory to write pcap + meta JSON (default: {DEFAULT_OUT_DIR})",
+    )
     args = p.parse_args()
 
     if args.cmd == "up":
@@ -522,7 +530,7 @@ def main() -> int:
     elif args.cmd == "status":
         cmd_status()
     elif args.cmd == "capture":
-        run_capture(args.name, attach_timeout=args.attach_timeout)
+        run_capture(args.name, out_dir=args.out_dir, attach_timeout=args.attach_timeout)
     return 0
 
 
