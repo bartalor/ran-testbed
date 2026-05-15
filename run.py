@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Live LTE testbed runner.
 
-Brings up Open5GS 4G core + srsenb + srsue over ZMQ, runs an attach, captures
-S1AP traffic on loopback, tears the stack down. Produces a pcap + meta JSON
-sidecar that downstream tools (detectors, fuzzers, conformance suites) consume
-by path.
+Brings up MongoDB + Open5GS 4G core + srsenb + srsue over ZMQ, runs an attach,
+captures S1AP traffic on loopback, tears the stack down. Produces a pcap + meta
+JSON sidecar that downstream tools (detectors, fuzzers, conformance suites)
+consume by path.
 
-Run as root (it needs to start systemd units, launch srsenb/srsue/tcpdump):
-    sudo python3 run.py capture legit_attach
-    sudo python3 run.py capture legit_attach --out-dir /path/to/captures
-    sudo python3 run.py status
-    sudo python3 run.py down
+Designed to run inside the project's container — Mongo and the eight Open5GS
+daemons are launched as child processes (no systemd), so the whole stack is
+owned by this script and dies with it.
+
+    # inside the container:
+    python3 /work/run.py capture legit_attach
+    python3 /work/run.py capture legit_attach --out-dir /captures
+
+Run as root (it needs SCTP sockets, raw pcap on lo, etc.).
 """
 
 from __future__ import annotations
@@ -32,31 +36,43 @@ from pathlib import Path
 
 LIVE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = LIVE_DIR / "configs"
+OPEN5GS_CONFIG_DIR = CONFIG_DIR / "open5gs"
 LOG_DIR = LIVE_DIR / "logs"
 DEFAULT_OUT_DIR = LIVE_DIR / "captures"
 
-SRSENB_BIN = Path("/home/bar/my_dev/srsRAN_4G/build/srsenb/src/srsenb")
-SRSUE_BIN = Path("/home/bar/my_dev/srsRAN_4G/build/srsue/src/srsue")
+SRSENB_BIN = Path("/usr/local/bin/srsenb")
+SRSUE_BIN = Path("/usr/local/bin/srsue")
+MONGOD_BIN = Path("/usr/bin/mongod")
+OPEN5GS_BIN_DIR = Path("/usr/bin")
 
-OPEN5GS_4G_UNITS = (
-    "open5gs-nrfd",
-    "open5gs-hssd",
-    "open5gs-mmed",
-    "open5gs-sgwcd",
-    "open5gs-smfd",
-    "open5gs-sgwud",
-    "open5gs-upfd",
-    "open5gs-pcrfd",
+# Open5GS 4G core daemons, in start order: NRF first (service discovery for
+# the 5G-style daemons that share infra), then HSS (subscriber DB), then the
+# rest. PCRF last since policy depends on the others being up.
+OPEN5GS_DAEMONS: tuple[str, ...] = (
+    "nrf",
+    "hss",
+    "mme",
+    "sgwc",
+    "smf",
+    "sgwu",
+    "upf",
+    "pcrf",
 )
 
 MME_SCTP_HOST = "127.0.0.2"
 MME_SCTP_PORT = 36412
+MONGO_HOST = "127.0.0.1"
+MONGO_PORT = 27017
 ZMQ_PORTS = (2000, 2001)
 
 ENB_READY_REGEX = re.compile(r"eNodeB started", re.IGNORECASE)
 S1_SETUP_FAIL_REGEX = re.compile(r"S1 Setup Failure", re.IGNORECASE)
 UE_ATTACH_REGEX = re.compile(r"Network attach successful", re.IGNORECASE)
 TCPDUMP_READY_REGEX = re.compile(r"listening on ", re.IGNORECASE)
+MONGO_READY_REGEX = re.compile(r"Waiting for connections", re.IGNORECASE)
+# Open5GS daemons all print a line like "MME initialize...done" once their
+# SCTP/GTPC/Diameter listeners are bound.
+OPEN5GS_READY_REGEX = re.compile(r"initialize\.\.\.done", re.IGNORECASE)
 
 
 # ---------- logging ----------
@@ -109,9 +125,11 @@ class IMSI:
 
 _ENB_MCC_RE = re.compile(r"^\s*mcc\s*=\s*(\S+)\s*(?:#.*)?$")
 _ENB_MNC_RE = re.compile(r"^\s*mnc\s*=\s*(\S+)\s*(?:#.*)?$")
+_RR_TAC_RE = re.compile(r"^\s*tac\s*=\s*(\S+?);")
 _UE_IMSI_RE = re.compile(r"^\s*imsi\s*=\s*(\d+)\s*(?:#.*)?$")
 _YAML_MCC_RE = re.compile(r"^\s*mcc:\s*(\S+)\s*$")
 _YAML_MNC_RE = re.compile(r"^\s*mnc:\s*(\S+)\s*$")
+_YAML_TAC_RE = re.compile(r"^\s*tac:\s*(\S+)\s*$")
 
 
 def _uncommented_lines(path: Path):
@@ -134,9 +152,39 @@ def parse_enb_plmn(path: Path) -> PLMN:
     return PLMN(mcc=mccs[0], mnc=mncs[0])
 
 
-def parse_mme_plmn(path: Path) -> PLMN:
-    """Active gummei+tai PLMN blocks in mme.yaml. Both must exist and agree."""
+def parse_rr_tac(path: Path) -> int:
+    """Active `tac = N;` lines in srsenb rr.conf. Exactly one expected."""
+    tacs: list[int] = []
+    in_block_comment = False
+    for raw in path.read_text().splitlines():
+        # Strip libconfig block comments (`/* ... */`) and line comments (`//`).
+        s = raw
+        if in_block_comment:
+            if "*/" in s:
+                s = s.split("*/", 1)[1]
+                in_block_comment = False
+            else:
+                continue
+        if "/*" in s:
+            before, _, rest = s.partition("/*")
+            if "*/" in rest:
+                s = before + rest.split("*/", 1)[1]
+            else:
+                s = before
+                in_block_comment = True
+        s = s.split("//", 1)[0]
+        if m := _RR_TAC_RE.match(s):
+            raw_val = m.group(1).strip().rstrip(";")
+            tacs.append(int(raw_val, 0))  # 0x.. or decimal
+    if len(tacs) != 1:
+        die(f"{path}: expected exactly one active `tac = N;`, got {tacs}")
+    return tacs[0]
+
+
+def parse_mme_plmn_tac(path: Path) -> tuple[PLMN, int]:
+    """Active gummei+tai PLMN/TAC in mme.yaml. Both PLMN blocks must agree."""
     plmns: list[PLMN] = []
+    tacs: list[int] = []
     pending_mcc: str | None = None
     for raw in path.read_text().splitlines():
         if raw.lstrip().startswith("#"):
@@ -149,13 +197,17 @@ def parse_mme_plmn(path: Path) -> PLMN:
                 die(f"{path}: found mnc without preceding mcc near {raw!r}")
             plmns.append(PLMN(mcc=pending_mcc, mnc=m.group(1)))
             pending_mcc = None
+        if m := _YAML_TAC_RE.match(raw):
+            tacs.append(int(m.group(1), 0))
     if pending_mcc is not None:
         die(f"{path}: trailing mcc {pending_mcc!r} with no matching mnc")
     if len(plmns) < 2:
         die(f"{path}: expected at least 2 active PLMN blocks (gummei + tai), got {plmns}")
     if len(set(plmns)) != 1:
         die(f"{path}: PLMN blocks disagree: {plmns}")
-    return plmns[0]
+    if len(tacs) != 1:
+        die(f"{path}: expected exactly one active `tac:`, got {tacs}")
+    return plmns[0], tacs[0]
 
 
 def parse_ue_imsi(path: Path) -> IMSI:
@@ -308,7 +360,7 @@ for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
 
 def require_root() -> None:
     if os.geteuid() != 0:
-        die("must run as root (sudo python3 run.py ...)")
+        die("must run as root")
 
 
 def port_free(port: int) -> bool:
@@ -328,24 +380,29 @@ def sctp_listening(host: str, port: int) -> bool:
 
 
 def preflight() -> None:
-    log("preflight: checking environment")
+    """Validate config consistency before bringing anything up.
+
+    Bound to the static config files only — does NOT check listeners or
+    running processes, since we own the entire lifecycle now.
+    """
+    log("preflight: checking config consistency")
     enb_conf = CONFIG_DIR / "enb.conf"
+    rr_conf = CONFIG_DIR / "rr.conf"
     ue_conf = CONFIG_DIR / "ue.conf"
-    mme_conf = Path("/etc/open5gs/mme.yaml")
-    for p in (enb_conf, ue_conf, mme_conf, SRSENB_BIN, SRSUE_BIN):
+    mme_conf = OPEN5GS_CONFIG_DIR / "mme.yaml"
+    for p in (enb_conf, rr_conf, ue_conf, mme_conf, SRSENB_BIN, SRSUE_BIN, MONGOD_BIN):
         if not p.exists():
             die(f"missing: {p}")
 
     enb_plmn = parse_enb_plmn(enb_conf)
-    mme_plmn = parse_mme_plmn(mme_conf)
+    enb_tac = parse_rr_tac(rr_conf)
+    mme_plmn, mme_tac = parse_mme_plmn_tac(mme_conf)
     imsi = parse_ue_imsi(ue_conf)
 
     if enb_plmn != mme_plmn:
-        die(
-            f"PLMN mismatch: enb={enb_plmn}, mme={mme_plmn}. "
-            f"Edit /etc/open5gs/mme.yaml (gummei + tai blocks) and restart open5gs-mmed."
-        )
-
+        die(f"PLMN mismatch: enb={enb_plmn}, mme={mme_plmn}")
+    if enb_tac != mme_tac:
+        die(f"TAC mismatch: enb rr.conf tac={enb_tac}, mme tai.tac={mme_tac}")
     if imsi.mcc != enb_plmn.mcc or imsi.mnc_for(enb_plmn) != enb_plmn.mnc:
         die(f"IMSI {imsi.value} PLMN prefix does not match {enb_plmn}")
 
@@ -353,44 +410,71 @@ def preflight() -> None:
         if not port_free(p):
             die(f"ZMQ port {p} already in use")
 
-    if not sctp_listening(MME_SCTP_HOST, MME_SCTP_PORT):
-        die(f"MME not listening on {MME_SCTP_HOST}:{MME_SCTP_PORT}. Run: sudo python3 run.py up")
-
-    log(f"preflight ok (plmn={enb_plmn}, imsi={imsi.value})", "ok")
+    log(f"preflight ok (plmn={enb_plmn}, tac={enb_tac}, imsi={imsi.value})", "ok")
 
 
-# ---------- Open5GS lifecycle ----------
+# ---------- stack lifecycle (mongo + open5gs) ----------
 
-def systemctl(action: str, units: tuple[str, ...]) -> None:
-    log(f"systemctl {action}: {', '.join(units)}")
-    subprocess.run(["systemctl", action, *units], check=True)
-
-
-def _all_units_active(units: tuple[str, ...]) -> bool:
-    r = subprocess.run(
-        ["systemctl", "is-active", *units], capture_output=True, text=True, check=False
+def _mongo_spec() -> ComponentSpec:
+    # In-container layout: /var/lib/mongodb for data, log to stderr (merged
+    # into the per-component log file by _pump). --bind_ip 127.0.0.1 keeps it
+    # off any external interface even if --net=host is used.
+    return ComponentSpec(
+        name="mongod",
+        argv=(
+            str(MONGOD_BIN),
+            "--dbpath", "/var/lib/mongodb",
+            "--bind_ip", MONGO_HOST,
+            "--port", str(MONGO_PORT),
+            "--logpath", "/var/log/mongodb/mongod.log",
+            "--logappend",
+        ),
+        ready_regex=MONGO_READY_REGEX,
     )
-    return all(line.strip() == "active" for line in r.stdout.splitlines())
 
 
-def core_up() -> None:
-    require_root()
-    if subprocess.run(["systemctl", "is-active", "--quiet", "mongod"]).returncode != 0:
-        subprocess.run(["systemctl", "start", "mongod"], check=True)
-    systemctl("start", OPEN5GS_4G_UNITS)
-    deadline = time.monotonic() + 10.0
+def _open5gs_spec(daemon: str) -> ComponentSpec:
+    """Build a ComponentSpec for one Open5GS daemon.
+
+    `daemon` is the short name ('mme', 'hss', ...). Binary lives at
+    /usr/bin/open5gs-<daemon>d, YAML at /etc/open5gs/<daemon>.yaml (which is
+    bind-mounted from configs/open5gs/<daemon>.yaml).
+    """
+    return ComponentSpec(
+        name=f"open5gs-{daemon}",
+        argv=(
+            str(OPEN5GS_BIN_DIR / f"open5gs-{daemon}d"),
+            "-c", f"/etc/open5gs/{daemon}.yaml",
+        ),
+        ready_regex=OPEN5GS_READY_REGEX,
+    )
+
+
+def _bring_up_core(stack: contextlib.ExitStack) -> None:
+    """Enter Mongo + 8 Open5GS daemons into the given ExitStack.
+
+    Bails out (via die) if any daemon doesn't reach ready within timeout —
+    the ExitStack ensures already-started daemons are torn down on the way
+    out of the caller's `with` block.
+    """
+    mongo = stack.enter_context(running(_mongo_spec()))
+    if not mongo.wait_ready(timeout=10.0):
+        die("mongod did not become ready; see logs/mongod.log")
+    log("mongod ready", "ok")
+
+    for daemon in OPEN5GS_DAEMONS:
+        cp = stack.enter_context(running(_open5gs_spec(daemon)))
+        if not cp.wait_ready(timeout=10.0):
+            die(f"open5gs-{daemon}d did not become ready; see logs/open5gs-{daemon}.log")
+
+    # MME SCTP listener is the real readiness signal for the eNB to attach.
+    deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        if _all_units_active(OPEN5GS_4G_UNITS) and sctp_listening(MME_SCTP_HOST, MME_SCTP_PORT):
-            log("open5gs 4G core up", "ok")
+        if sctp_listening(MME_SCTP_HOST, MME_SCTP_PORT):
+            log("open5gs core up; MME SCTP listening", "ok")
             return
-        time.sleep(0.2)
-    die("open5gs 4G core did not become ready within 10s")
-
-
-def core_down() -> None:
-    require_root()
-    systemctl("stop", OPEN5GS_4G_UNITS)
-    log("open5gs 4G core down", "ok")
+        time.sleep(0.1)
+    die(f"MME not listening on {MME_SCTP_HOST}:{MME_SCTP_PORT} after core start")
 
 
 # ---------- capture pipeline ----------
@@ -440,7 +524,11 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
     attached = False
     # ExitStack guarantees reverse-order teardown for every entered context,
     # whether we leave normally, by exception, or via a signal-raised _Interrupted.
+    # Order: mongo → 8 open5gs daemons → tcpdump → srsenb → srsue.
+    # Teardown unwinds the opposite way.
     with contextlib.ExitStack() as stack:
+        _bring_up_core(stack)
+
         tcpdump = stack.enter_context(running(_tcpdump_spec(pcap_path)))
         if not tcpdump.wait_ready(timeout=5.0):
             die("tcpdump did not start listening; see logs/tcpdump.log")
@@ -459,7 +547,7 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
         else:
             log("attach successful", "ok")
             time.sleep(2.0)
-        # ExitStack stops UE → eNB → tcpdump here, in that order.
+        # ExitStack stops UE → eNB → tcpdump → open5gs → mongo here.
 
     enb_plmn = parse_enb_plmn(CONFIG_DIR / "enb.conf")
     ue_imsi = parse_ue_imsi(CONFIG_DIR / "ue.conf")
@@ -469,7 +557,9 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
         "attached": attached,
         "plmn": {"mcc": enb_plmn.mcc, "mnc": enb_plmn.mnc},
         "imsi": ue_imsi.value,
-        "srsran_commit": _git_commit(Path("/home/bar/my_dev/srsRAN_4G")),
+        "srsran_ref": os.environ.get("SRSRAN_REF"),
+        "open5gs_version": os.environ.get("OPEN5GS_VERSION"),
+        "mongo_version": os.environ.get("MONGO_VERSION"),
         "kernel": os.uname().release,
         "pcap_size_bytes": pcap_path.stat().st_size if pcap_path.exists() else 0,
     }
@@ -479,40 +569,12 @@ def run_capture(name: str, out_dir: Path, attach_timeout: float = 30.0) -> Path:
     return pcap_path
 
 
-def _git_commit(repo: Path) -> str | None:
-    if not (repo / ".git").exists():
-        return None
-    r = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
-    )
-    return r.stdout.strip() if r.returncode == 0 else None
-
-
-# ---------- status ----------
-
-def cmd_status() -> None:
-    log("status")
-    for u in OPEN5GS_4G_UNITS:
-        r = subprocess.run(["systemctl", "is-active", u], capture_output=True, text=True)
-        print(f"  {u:20s} {r.stdout.strip()}")
-    print(f"  mme sctp listen     {'yes' if sctp_listening(MME_SCTP_HOST, MME_SCTP_PORT) else 'no'}")
-    for p in ZMQ_PORTS:
-        print(f"  zmq {p} free       {'yes' if port_free(p) else 'no'}")
-    stragglers = subprocess.run(
-        ["pgrep", "-af", "srsenb|srsue|tcpdump.*legit_attach"], capture_output=True, text=True
-    ).stdout.strip()
-    print(f"  stragglers          {stragglers or 'none'}")
-
-
 # ---------- CLI ----------
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="LTE testbed runner")
+    p = argparse.ArgumentParser(description="LTE testbed runner (container-internal)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("up", help="start Open5GS 4G core")
-    sub.add_parser("down", help="stop Open5GS 4G core")
-    sub.add_parser("status", help="show stack status")
-    c = sub.add_parser("capture", help="run attach scenario and save pcap")
+    c = sub.add_parser("capture", help="bring up stack, run attach, save pcap, tear down")
     c.add_argument("name", help="scenario name, used in pcap filename")
     c.add_argument("--attach-timeout", type=float, default=30.0)
     c.add_argument(
@@ -523,13 +585,7 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    if args.cmd == "up":
-        core_up()
-    elif args.cmd == "down":
-        core_down()
-    elif args.cmd == "status":
-        cmd_status()
-    elif args.cmd == "capture":
+    if args.cmd == "capture":
         run_capture(args.name, out_dir=args.out_dir, attach_timeout=args.attach_timeout)
     return 0
 
